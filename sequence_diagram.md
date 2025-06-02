@@ -205,66 +205,90 @@ sequenceDiagram
 
 ## 4. Connector Management Flow
 
-### Connector Creation and LLM Interaction Flow
+### Connector Endpoint Creation and LLM Interaction Flow
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant API as APIConnector
-    participant Connector
+    participant API as APIConnectorEndpoint
     participant ConnectorEndpoint
     participant Storage
+    participant Connector
     participant LLM as External_LLM
     participant RateLimit as RateLimiter
     
     %% Connector Endpoint Creation
-    User->>API: api_create_connector_endpoint(endpoint_args)
-    API->>ConnectorEndpoint: validate_arguments(args)
-    ConnectorEndpoint->>Storage: create_object(CONNECTORS_ENDPOINTS, id, config)
-    Storage-->>ConnectorEndpoint: file_path
+    User->>API: api_create_endpoint(name, connector_type, uri, token, model, params)
+    API->>API: create ConnectorEndpointArguments(args)
+    API->>ConnectorEndpoint: create(endpoint_args)
+    ConnectorEndpoint->>ConnectorEndpoint: generate ep_id = slugify(name)
+    ConnectorEndpoint->>Storage: create_object(CONNECTORS_ENDPOINTS, ep_id, config)
+    Storage-->>ConnectorEndpoint: success
     ConnectorEndpoint-->>API: endpoint_id
     API-->>User: endpoint_created
     
-    %% Connector Loading and Prediction
+    %% Connector Loading and Prediction Flow
     User->>API: get_prediction(prompt, endpoint_id)
+    API->>ConnectorEndpoint: read(endpoint_id)
+    ConnectorEndpoint->>Storage: read_object(CONNECTORS_ENDPOINTS, endpoint_id)
+    Storage-->>ConnectorEndpoint: endpoint_config
+    ConnectorEndpoint->>ConnectorEndpoint: add creation_datetime
+    ConnectorEndpoint-->>API: ConnectorEndpointArguments
+    
     API->>Connector: load(endpoint_args)
-    Connector->>Storage: read_object(CONNECTORS_ENDPOINTS, endpoint_id)
-    Storage-->>Connector: endpoint_config
-    
+    Connector->>Connector: get_instance(connector_type, filepath)
+    Note over Connector: Dynamic loading of<br/>connector implementation
     Connector->>Connector: __init__(endpoint_args)
-    Note over Connector: Initialize rate limiter,<br/>semaphore, tokens
+    Note over Connector: Initialize rate limiter,<br/>semaphore, token bucket
     
-    Connector->>RateLimit: acquire_semaphore()
-    RateLimit->>RateLimit: check_token_availability()
+    %% Rate Limited Prediction Call
+    API->>Connector: get_prediction(prompt_args, connector)
+    Connector->>Connector: @rate_limited wrapper
+    Connector->>RateLimit: acquire semaphore()
+    RateLimit->>RateLimit: _add_tokens() - refill bucket
     
-    alt Tokens available
-        RateLimit->>RateLimit: consume_token()
+    alt Tokens >= 1
+        RateLimit->>RateLimit: consume 1 token
         RateLimit-->>Connector: proceed
-    else No tokens available
-        RateLimit->>RateLimit: calculate_sleep_time()
-        RateLimit->>RateLimit: sleep(wait_time)
-        RateLimit->>RateLimit: add_tokens()
+    else Tokens < 1
+        RateLimit->>RateLimit: calculate sleep_time = (1-tokens)/rate_limiter
+        RateLimit->>RateLimit: await sleep(sleep_time)
+        RateLimit->>RateLimit: _add_tokens() - refill after sleep
+        RateLimit->>RateLimit: consume 1 token
         RateLimit-->>Connector: proceed
     end
     
-    Connector->>Connector: perform_retry_wrapper()
+    %% Retry Mechanism
+    Connector->>Connector: @perform_retry wrapper
     
-    loop Retry attempts (max 3)
-        Connector->>LLM: HTTP request(prompt, model_params)
+    loop Retry attempts (max_attempts from config)
+        Connector->>LLM: get_response(prompt) - HTTP request
         
-        alt Success
-            LLM-->>Connector: response
-            Connector->>Connector: parse_response()
+        alt Success Response
+            LLM-->>Connector: ConnectorResponse(response, None, None)
+            Connector->>Connector: log successful prediction
             break
-        else API Error
-            LLM-->>Connector: error
-            Connector->>Connector: log_retry_attempt()
-            Connector->>Connector: exponential_backoff()
+        else API Error (Rate limit, timeout, etc.)
+            LLM-->>Connector: Exception/Error
+            Connector->>Connector: perform_retry_callback(connector_id, retry_state)
+            Connector->>Connector: log retry attempt with error details
+            
+            alt Final attempt
+                Connector->>Connector: raise exception
+            else More attempts remaining
+                Connector->>Connector: wait_random_exponential(min=1, max=60)
+            end
         end
     end
     
-    Connector->>RateLimit: release_semaphore()
-    Connector-->>API: connector_response
+    Connector->>Connector: record end_time and calculate duration
+    Connector->>RateLimit: release semaphore()
+    Connector-->>API: ConnectorPromptArguments(updated with prediction & duration)
+    
+    opt Prompt Callback exists
+        API->>API: prompt_callback(updated_prompt_args, connector_id)
+    end
+    
     API-->>User: prediction_result
 ```
 
